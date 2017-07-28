@@ -1,13 +1,16 @@
 const sg = require('sendgrid')(process.env.SG_API_KEY);
 sg.globalRequest.headers['User-Agent'] = 'subscription-widget/1.0.0';
 
+var hashAuthToken = require('./validate')(process.env.HASH_TOKEN_SECRET);
+
 const path = require('path');
 const Settings = require('../../settings');
 const optIn = 'opt-in';
 
 function prepareConfirmationEmail(reqBody) {
 	const subject = "Please Confirm Your Email Address";
-	const url = formatUrl(Settings.url) + '/success';
+    const accessToken = hashAuthToken.generate({email: reqBody.email, sent: Date.now()}, 3600);
+	const url = formatUrl(Settings.url) + '/validate?accessToken='+accessToken;
 	const link = "<a href='" + url + "'>this link</a>"
 	const mailText = "Thanks for signing up! Click " + link + " to sign up!  This link will be active for 24 hours.";
 
@@ -53,7 +56,7 @@ function prepareConfirmationEmail(reqBody) {
 
 function prepareNotificationEmail(reqBody) {
 	const subject = "New email signup";
-	const mailText = "A new person just confirmed they would look to receive your emails via your email subscription widget.<br/><b>Name: </b>" + reqBody.first_name + " " + reqBody.last_name + "<br/><b>Email: </b>" + reqBody.email;
+	const mailText = "A new person just confirmed they would look to receive your emails via your email subscription widget.<br/><b>Name: </b><br/><b>Email: </b>" + reqBody.email;
 
 	var emailBody = {
 	  personalizations: [
@@ -102,134 +105,84 @@ exports.sendConfirmation = (req, res, next) => {
 	});
 }
 
-// Create new contact and add contact to given list
-exports.addUser = function(req, res, next) {
-	addUserToList(req.body[0], function() {
-		//send notification about the new signup
-		if (Settings.sendNotification) {
-			console.log("Sending notification");
+exports.validateEmail = function (req, res, next) {
 
-			var request = sg.emptyRequest({
-				method: 'POST',
-				path: '/v3/mail/send',
-				body: prepareNotificationEmail(req.body[0])
-			});
+	var accessToken = req.query.accessToken;
+	if (accessToken) {
+		console.log('accessToken ', accessToken);
+        var userObj = hashAuthToken.verify(accessToken);
+        if (userObj) {
+            addUserToList(userObj, function() {
+                //send notification about the new signup
+                if (Settings.sendNotification) {
+                    console.log("Sending notification");
 
-			sg.API(request, function(error, response) {
-				if (error) {
-					console.log('Error sending notification');
-				}
-			});
+                    var request = sg.emptyRequest({
+                        method: 'POST',
+                        path: '/v3/mail/send',
+                        body: prepareNotificationEmail(userObj)
+                    });
+
+                    sg.API(request, function(error, response) {
+                        if (error) {
+                            res.sendFile(path.join(__dirname, '../static/error.html'));
+                        }
+                    });
+                }
+
+                res.sendFile(path.join(__dirname, '../static/success.html'));
+            });
+
+		} else {
+            res.sendFile(path.join(__dirname, '../static/error.html'));
 		}
+	} else {
+        res.sendFile(path.join(__dirname, '../static/error.html'));
+	}
 
-		res.sendStatus(200);
-	});
 }
 
 function addUserToList(emailBody, callback) {
-	console.log(emailBody);
+	console.log('addUserToList ', emailBody);
 
-	var ignoreFields = ['ip', 'sg_event_id', 'sg_message_id', 'useragent', 'event',
-		'url_offset', 'time_sent', 'timestamp', 'url', 'type', 'smtp-id'];
+    const timestamp = parseInt(emailBody.validTo);
+    const listId = Settings.listId;
+    const secondsInDay = 86400;
+    const timeElapsed = (Date.now() - timestamp) / 1000;
 
-	var customFields = [{}];
-	var customFieldArr = [];
+    // Confirm email type is opt in and link has been clicked within 1 day
+    if (timeElapsed < secondsInDay) {
+        var request = sg.emptyRequest({
+            method: 'POST',
+            path: '/v3/contactdb/recipients',
+            body: [{email:emailBody.email}]
+        });
 
-	for (key in emailBody) {
-		if (!stringInArray(key, ignoreFields)) {
-			customFields[0][key] = emailBody[key];
-			if (key != 'email' && key != 'first_name' && key != 'last_name') {
-				customFieldArr.push(key);
-			}
-		}
-	}
+        sg.API(request, function(error, response) {
+        	console.log('response ', response.body);
+            if (listId) {
+                var contactID = JSON.parse(response.body.toString()).persisted_recipients[0];
+                console.log('path ', '/v3/contactdb/lists/' + listId + '/recipients/' + contactID);
+                var request = sg.emptyRequest({
+                    method: 'POST',
+                    path: '/v3/contactdb/lists/' + listId + '/recipients/' + contactID,
+                    body: [{email:emailBody.email}]
+                });
+                sg.API(request, function(error, response) {
+                    console.log(response.statusCode)
+                    console.log(response.body)
+                    console.log(response.headers)
 
-	checkAndAddCustomFields(customFieldArr, function() {
-		const emailType = emailBody.type;
-		const timestamp = parseInt(emailBody.time_sent);
-		const listId = Settings.listId;
-		const secondsInDay = 86400;
-		const timeElapsed = (Date.now() - timestamp) / 1000;
+                    callback();
+                });
+            } else {
+                callback();
+            }
+        });
+    } else {
+        res.sendFile(path.join(__dirname, '../static/error.html'));
+    }
 
-		// Confirm email type is opt in and link has been clicked within 1 day
-		if (emailType == optIn && timeElapsed < secondsInDay) {
-			var request = sg.emptyRequest({
-				method: 'POST',
-				path: '/v3/contactdb/recipients',
-				body: customFields
-			});
-
-			sg.API(request, function(error, response) {
-		    	if (listId) {
-					var contactID = JSON.parse(response.body.toString()).persisted_recipients[0];
-					var request = sg.emptyRequest({
-						method: 'POST',
-						path: '/v3/contactdb/lists/' + listId + '/recipients/' + contactID,
-						body: customFields
-					});
-					sg.API(request, function(error, response) {
-				    	console.log(response.statusCode)
-				    	console.log(response.body)
-				    	console.log(response.headers)
-
-						callback();
-					});
-				} else {
-					callback();
-				}
-			});
-		} else {
-			callback();
-		}
-	});
-
-}
-
-function checkAndAddCustomFields(submittedFields, callback) {
-	var request = sg.emptyRequest({
-		method: 'GET',
-		path: '/v3/contactdb/custom_fields',
-	});
-
-	sg.API(request, function(error, response) {
-    	console.log(response.statusCode)
-    	console.log(response.body)
-    	console.log(response.headers)
-
-    	var existingCustomFields = JSON.parse(response.body);
-		var fieldsToCreate = [];
-
-		submittedFields.map((submittedField) => {
-			var fieldExists = false;
-			existingCustomFields.custom_fields.map((field) => {
-				if (submittedField == field.name) {
-					fieldExists = true;
-				}
-			});
-			if (!fieldExists) {
-				fieldsToCreate.push(submittedField)
-			}
-		});
-
-		if (fieldsToCreate.length == 0) {
-			callback();
-		} else {
-			fieldsToCreate.map((fieldsToCreate) => {
-				var body = { name: fieldsToCreate, type: 'text' };
-
-				var request = sg.emptyRequest({
-					method: 'POST',
-					path: '/v3/contactdb/custom_fields',
-					body: body
-				});
-
-				sg.API(request, function(error, response) {
-			    	callback();
-			    });
-			});
-		}
-
-    });
 }
 
 function formatUrl(url) {
@@ -237,14 +190,4 @@ function formatUrl(url) {
 		return url.substring(0, url.length - 1);
 	}
 	return url;
-}
-
-function stringInArray(string, array) {
-	var isInArray = false;
-	array.map((item) => {
-		if (string == item) {
-			isInArray = true;
-		}
-	});
-	return isInArray;
 }
